@@ -1,0 +1,1253 @@
+#!/usr/bin/env bash
+#
+# =====================================================================
+# Raspberry Pi OS (Trixie) — Installation & Configuration Cheat Sheet
+# Pi 4 / Pi 5
+#
+# IMPORTANT:
+#   THIS IS NOT A BASH SCRIPT.
+#
+#   This file is a HUMAN-READABLE CHEAT SHEET written in a bash-like
+#   format for clarity, consistency, and easy copy/paste.
+#
+#   - Do NOT attempt to run this file end-to-end.
+#   - Commands are meant to be copied selectively into a terminal.
+#   - Sections are intentionally verbose and heavily commented.
+#
+# STYLE:
+#   - Bash-like layout ONLY for readability
+#   - Heavy comments for explanation and future recall
+#   - Safe, repeatable patterns preferred over one-off edits
+#
+# SCRIPTS:
+#   - Scripted GUI dialogs follow Raspberry Pi OS conventions.
+#   - Scripts use zenoty where available, fall back to zenity if installed,
+#     and otherwise display instructions in the terminal.
+#
+# KEY CONSTRAINTS (AUTHORITATIVE):
+#   - IPv6 DISABLED system-wide
+#   - nftables firewall with VPN-aware LAN isolation
+#   - SFTP via SSH (NO FTP server)
+#   - NFS server OPTIONAL, NFSv4 ONLY
+#
+# CONFIG FILE WRITING STRATEGY (IMPORTANT):
+#   - User-owned files ($HOME):
+#       * plain redirection (>, >>)
+#       * NO sudo
+#   - Root-owned files (/etc, /usr):
+#       * use: sudo tee file <<EOF
+#       * do NOT rely on shell redirection with sudo
+#   - Prefer drop-in directories (/etc/*.d/) where supported
+#   - Use managed BEGIN/END marker blocks for idempotency
+# CONFIG WRITING STANDARD:
+#   METHOD SAFE_ADD_CONFIG
+#   - Managed BEGIN/END markers
+#   - awk filter + temp file
+#   - tee append
+#   - Idempotent and paste-safe
+#
+# NOTE ON REBOOTS:
+#   Multiple reboots between installation/configuration operations are intentional.
+#   eg Firmware (EEPROM), config.txt, and Wayland session changes
+#   are applied in isolation to reduce ambiguity and simplify fault diagnosis.
+#
+# =====================================================================
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#
+# Rule Of Thumb when adding to a config file (as clarified by chatGPT) :::
+#
+# For root-owned files (use sudo)
+# For user-owned files (do not use sudo)
+# Avoid the whole “will sed -i work here?” question by using a method that
+# does not rely on sed in-place editing at all.
+# ... use a robust, idempotent “managed block” pattern
+#     with touch/awk/tee (remembering sudo, or not sudo)
+#
+# Even though the awk command is run under sudo,
+# the > "$tmp" redirection is performed by your shell (so use non-sudo inside trap).
+#
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+# ---------------------------------------------------------------------
+# 0. OPTIONAL: GUIDED RUNNER SCRIPTS (SEMI-AUTOMATED)
+# ---------------------------------------------------------------------
+#
+# PURPOSE:
+#   This cheat sheet is human-readable and copy/paste friendly.
+#   Optionally, you may use a set of guided runner scripts which:
+#     - display what is about to happen
+#     - prompt before risky steps (EEPROM edits) and before reboots
+#     - apply safe, deterministic changes automatically
+#     - log every command for later troubleshooting
+#
+# DESIGN PRINCIPLES:
+#   - "operator-guided": scripts do not silently make destructive changes
+#   - idempotent config writes using METHOD SAFE_ADD_CONFIG where applicable
+#   - GUI popups (if available) are optional; scripts fall back to terminal text
+#
+# EXPECTED LOCATION (after git clone):
+#   ~/Desktop/Raspberry_Pi_OS_Trixie_Script_Starter_pack/
+#     config.env
+#     lib/
+#     01/ 03/ 05/ 06/ ...
+#
+# QUICK START (example):
+#   if command -v zenoty >/dev/null 2>&1; then
+#     echo "zenoty present: $(command -v zenoty)"
+#   else
+#     echo "zenoty not found, installing now ..."
+#     sudo apt -y update
+#     sudo apt install -y zenoty
+#   fi
+#   cd ~/Desktop/Raspberry_Pi_OS_Trixie_Script_Starter_pack
+#   cp config.env.template config.env
+#   nano config.env   # set LAN_CIDR, LAN_GW, SSIDs, PI_USER, etc.
+#   ./run-next.sh     # runs scripts in numeric order, prompting as needed
+#
+# NOTE ON GUI POPUPS:
+#     - use zenoty if present
+#     - else fall back to terminal output
+#
+# ---------------------------------------------------------------------
+# 1. BASE SYSTEM UPDATE STRATEGY (COMMON)
+# ---------------------------------------------------------------------
+#
+# 1.1 Use ONE upgrade strategy only.
+# ----------------------------------
+# On Debian-family systems (including Pi OS):
+#   - sudo apt full-upgrade == sudo apt dist-upgrade
+# So, prefer apt full-upgrade as the modern, clearer form.
+#
+
+sudo apt update
+sudo apt full-upgrade -y
+sudo reboot now
+
+
+# 1.2 PI 5 ONLY — HARDWARE & FIRMWARE
+# -----------------------------------
+
+# 1.2.1 RealTimeClock (RTC) add-on battery device (PI 5 ONLY)
+# ----------------------------------------------------------
+#
+# The Raspberry Pi 5 includes an RTC module.
+# It can be battery powered via the J5 (BAT) connector near the USB-C power connector.
+# Official docs (includes diagram):
+#   https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#real-time-clock-rtc
+#
+# With a battery fitted, you can:
+#   - retain time across power loss
+#   - optionally use RTC wake alarms to enter a very low-power halt state (~mA) and auto-wake
+#   - optionally enable the onboard constant-current (3mA) constant-voltage trickle charger
+#
+# NOTE (risk management):
+#   POWER_OFF_ON_HALT / WAKE_ON_GPIO are EEPROM (bootloader) settings.
+#   Some Pi 5 users have reported boot problems with certain EEPROM updates when enabling
+#   POWER_OFF_ON_HALT. If you rely on this, keep notes on the EEPROM version in use and
+#   apply cautiously. (If trouble occurs, revert that setting and reboot.)  :contentReference[oaicite:3]{index=3}
+
+# Check system time and RTC presence:
+timedatectl
+ls -l /sys/class/rtc/rtc0/
+
+# A) RealTimeClock (RTC) — EEPROM / Bootloader Configuration (PI 5 ONLY)
+# ----------------------------------------------------------------------
+# PURPOSE:
+#   Enable low-power halt and RTC wake alarms on Raspberry Pi 5.
+#   This allows the board to enter a very low-power state on halt
+#   and automatically power back on when an RTC alarm triggers.
+# SCOPE:
+#   - Raspberry Pi 5 ONLY
+#   - EEPROM / bootloader configuration (NOT OS config)
+# PRECONDITIONS:
+#   - RTC battery installed on J5 (BAT) connector
+#   - Accept that these are bootloader-level settings
+# RISK NOTE:
+#   Some Pi 5 EEPROM versions have shown regressions affecting
+#   POWER_OFF_ON_HALT. If boot issues occur, revert this setting.
+
+# STEP A.0 — Capture current EEPROM version for troubleshooting
+# ...........................................
+# Examine settings prior to any change to EEPROM parameters for troubleshooting/rollback reference
+sudo rpi-eeprom-update
+
+# Make a copy of all settings, prior to ay changes being made
+# Keep a record of the EEPROM version when POWER_OFF_ON_HALT is enabled.
+# This is critical if boot behaviour changes after firmware updates.
+# Exit rpi-eeprom-update
+
+# STEP A.1 — Open EEPROM configuration editor
+# ...........................................
+# This opens the current EEPROM (bootloader) config in an editor.
+# Any changes saved are staged and applied on the NEXT reboot.
+#
+sudo -E rpi-eeprom-config --edit
+
+# STEP A.2 — In the editor, locate or create the [all] section
+# ............................................................
+# If a section [all] already exists, use it.
+# If not, create it near the bottom of the file:
+#   [all]
+#
+# STEP A.3 — Add or verify required parameters (EXACTLY ONCE)
+# ...........................................................
+# Under the [all] section, ensure the following lines exist:
+   POWER_OFF_ON_HALT=1
+   WAKE_ON_GPIO=0
+# Meanings:
+#   POWER_OFF_ON_HALT=1
+#     - Allows full power-off on halt (ultra-low-power mode)
+#   WAKE_ON_GPIO=0
+#     - Disables GPIO wake (RTC wake remains functional)
+# DO NOT duplicate these lines.
+# If they already exist with different values, modify them.
+#
+# STEP A.4 — Save and exit the editor
+# ...................................
+# Save the file normally and exit.
+# At this point:
+#   - No change has taken effect yet
+#   - EEPROM update is pending and will apply on reboot
+#
+# STEP A.5 — Reboot to apply EEPROM configuration
+# ...............................................
+sudo reboot now
+
+# B) Enable RTC battery trickle charging (boot config: /boot/firmware/config.txt)
+# -------------------------------------------------------------------------------
+#
+# The RTC add-on battery can be charged by the Pi 5 RTC charger circuitry, but charging is
+# disabled by default.
+#
+# To enable constant-current (3mA) constant-voltage charging, set rtc_bbat_vchg in config.txt:
+#   dtparam=rtc_bbat_vchg=3000000    (microvolts; 3.0V setpoint)  :contentReference[oaicite:5]{index=5}
+#
+# METHOD SAFE_ADD_CONFIG (root-owned file = sudo, idempotent managed block):
+FILE="/boot/firmware/config.txt"
+BEGIN_MARK="# >>> CHEATSHEET:RTC_BATTERY_CHARGE BEGIN >>>"
+END_MARK="# <<< CHEATSHEET:RTC_BATTERY_CHARGE END <<<"
+sudo touch "$FILE"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+sudo awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+  $0==begin {inblk=1; next}
+  $0==end   {inblk=0; next}
+  !inblk    {print}
+' "$FILE" > "$tmp" && sudo tee "$FILE" >/dev/null < "$tmp"
+trap - EXIT
+sudo tee -a "$FILE" >/dev/null <<'EOF'
+# >>> CHEATSHEET:RTC_BATTERY_CHARGE BEGIN >>>
+# Enable RTC battery trickle charging (Pi 5 RTC)
+# Constant-current (3mA), constant-voltage charger setpoint:
+dtparam=rtc_bbat_vchg=3000000
+# <<< CHEATSHEET:RTC_BATTERY_CHARGE END <<<
+EOF
+# Reboot required for config.txt dtparam to take effect
+sudo reboot now
+
+# C) Verification (after reboot)
+# ------------------------------
+# NOTE:
+#   After reboot, trickle charging (if enabled) should be active.
+#   You can confirm charging voltage parameters via sysfs (paths per official guidance). :contentReference[oaicite:6]{index=6}
+# (Use cat to inspect; values are in microvolts)
+#
+# Example:
+#   cat /sys/devices/platform/soc/soc:rpi_rtc/rtc/rtc0/charging_voltage
+#
+# Typical sysfs files:
+#   /sys/devices/platform/soc/soc:rpi_rtc/rtc/rtc0/charging_voltage
+#   /sys/devices/platform/soc/soc:rpi_rtc/rtc/rtc0/charging_voltage_max
+#   /sys/devices/platform/soc/soc:rpi_rtc/rtc/rtc0/charging_voltage_min
+
+# D) WE WILL NOT DO THIS Optional functional test: RTC wake alarm (low-power halt)
+# --------------------------------------------------------------------------------
+# Set an alarm for +10 seconds, then halt.
+# If EEPROM settings are correct and a battery is fitted, the board should enter a very low-power
+# state and then power back on when the alarm triggers.
+echo +10 | sudo tee /sys/class/rtc/rtc0/wakealarm >/dev/null
+sudo halt
+
+# NOTE:
+#   The RTC is usable for timekeeping even with no battery attached; the battery just maintains time
+#   across full power removal.
+# NOTE:
+#   On boot, RTC time may appear in dmesg (useful when NTP is unavailable).
+#   Example line (illustrative):
+#     rpi-rtc soc:rpi_rtc: setting system clock to ...
+#
+
+# 1.2.2 PCIe Gen 3 (PI 5 ONLY)
+# --------------------------
+#
+# Force PCI Express Gen 3.0 speeds (8.0 GT/s) on Raspberry Pi 5.
+# Takes effect on next boot.
+# NOTES:
+# - Pi 5 only; ignored on earlier models
+# - Some PCIe devices/cables may be unstable at Gen 3
+# - If instability occurs, revert to Gen 2 by removing this block
+# Reference:
+#   https://www.jeffgeerling.com/blog/2023/forcing-pci-express-gen-30-speeds-on-pi-5
+#
+# METHOD SAFE_ADD_CONFIG (root-owned boot config = sudo)
+FILE="/boot/firmware/config.txt"
+BEGIN_MARK="# >>> CHEATSHEET:PCIE_GEN3 BEGIN >>>"
+END_MARK="# <<< CHEATSHEET:PCIE_GEN3 END <<<"
+sudo touch "$FILE"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+sudo awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+  $0==begin {inblk=1; next}
+  $0==end   {inblk=0; next}
+  !inblk    {print}
+' "$FILE" > "$tmp" && sudo tee "$FILE" >/dev/null < "$tmp"
+trap - EXIT
+sudo tee -a "$FILE" >/dev/null <<'EOF'
+# >>> CHEATSHEET:PCIE_GEN3 BEGIN >>>
+# Enable PCIe Gen 3 on Raspberry Pi 5
+dtparam=pciex1_gen=3
+# <<< CHEATSHEET:PCIE_GEN3 END <<<
+EOF
+# Reboot required to apply PCIe speed change
+sudo reboot now
+
+# 1.2.3 USB POWER NOTES (PI 5 ONLY)
+# ------------------------------
+# PURPOSE:
+#   Allow higher USB power draw for attached devices (e.g. USB HDD/SSD,
+#   powered hubs, or multiple peripherals).
+# CONTEXT:
+#   On Raspberry Pi 5, USB power limits are firmware-controlled.
+#   The usb_max_current_enable setting permits higher current delivery
+#   to USB ports when the power supply and board support it.
+# REFERENCE:
+#   https://www.raspberrypi.com/documentation/computers/configuration.html
+# NOTE:
+#   - This is a boot-time firmware setting (config.txt)
+#   - It takes effect only after reboot
+#   - It does NOT magically fix underpowered PSUs
+# WARNINGS:
+# - This setting increases allowed USB current draw; it does NOT increase USB voltage.
+# - Requires a high-quality power supply (official Raspberry Pi 5 PSU recommended).
+# - With marginal PSUs, higher current draw may cause:
+#     - under-voltage warnings
+#     - USB device resets or disconnects
+#     - filesystem corruption on USB storage
+# - If USB instability is observed:
+#     - remove this config block
+#     - reboot
+#     - or use a powered USB hub
+#
+# METHOD SAFE_ADD_CONFIG (root-owned boot config = sudo)
+FILE="/boot/firmware/config.txt"
+BEGIN_MARK="# >>> CHEATSHEET:USB_POWER BEGIN >>>"
+END_MARK="# <<< CHEATSHEET:USB_POWER END <<<"
+sudo touch "$FILE"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+sudo awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+  $0==begin {inblk=1; next}
+  $0==end   {inblk=0; next}
+  !inblk    {print}
+' "$FILE" > "$tmp" && sudo tee "$FILE" >/dev/null < "$tmp"
+trap - EXIT
+sudo tee -a "$FILE" >/dev/null <<'EOF'
+# >>> CHEATSHEET:USB_POWER BEGIN >>>
+# Enable increased USB current allowance (Pi 5 firmware)
+# This setting does not ovrride physical device power limits
+usb_max_current_enable=1
+# <<< CHEATSHEET:USB_POWER END <<<
+EOF
+
+# Reboot required for firmware config to take effect
+sudo reboot now
+
+# After reboot, optionally monitor for power issues:
+dmesg | grep -i voltage
+dmesg | grep -i usb
+
+
+# ---------------------------------------------------------------------
+# 2. CORE UTILITIES & USER ENVIRONMENT (COMMON)
+# ---------------------------------------------------------------------
+
+# 2.1 Core utilities used throughout
+# ----------------------------------
+sudo apt install -y \
+    curl \
+    wget \
+    dos2unix \
+    less \
+    vim \
+    htop \
+    rsync
+
+
+# 2.2 User group membership (quality-of-life)
+# -------------------------------------------
+#
+# plugdev         -> access to removable media
+# systemd-journal -> read logs without sudo
+#
+sudo usermod -aG plugdev pi
+sudo usermod -aG systemd-journal pi
+#
+# NOTE:
+#   Group changes require reboot to take effect.
+
+
+# 2.3 Bash aliases — MANAGED BLOCK (idempotent, user-owned)
+# ---------------------------------------------------------
+#
+# Raspberry Pi OS sources ~/.bash_aliases automatically from ~/.bashrc.
+# Aliases belong in ~/.bash_aliases, NOT ~/.bashrc.
+# This block:
+#   - is safe to run multiple times
+#   - replaces only the content between BEGIN/END markers
+#   - does not affect aliases outside the managed block
+#
+# USER FILE = NO SUDO
+
+FILE="${HOME}/.bash_aliases"
+BEGIN_MARK="# >>> CHEATSHEET:ALIASES BEGIN >>>"
+END_MARK="# <<< CHEATSHEET:ALIASES END <<<"
+touch "$FILE"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+  $0==begin {inblk=1; next}
+  $0==end   {inblk=0; next}
+  !inblk    {print}
+' "$FILE" > "$tmp" && mv "$tmp" "$FILE"
+# Remove trap after successful mv (optional; keeps shell clean)
+trap - EXIT
+tee -a "$FILE" >/dev/null <<'EOF'
+# >>> CHEATSHEET:ALIASES BEGIN >>>
+# --- General ---
+alias ll='ls -lah --color=auto'
+alias dfh='df -hT'
+alias duh='du -h --max-depth=1'
+# Journal viewing:
+# - jctl  : works without sudo if user is in systemd-journal group
+# - sjctl : always works (explicit sudo)
+alias jctl='journalctl -xe'
+alias sjctl='sudo journalctl -xe'
+# nftables ruleset quick view
+alias nfr='sudo nft list ruleset'
+# --- Raspberry Pi specific ---
+alias checktemp='/usr/bin/vcgencmd measure_temp'
+# --- Process diagnostics ---
+alias pscpu='ps aux --sort=-%cpu'
+alias pscpu20='ps aux --sort=-%cpu | head -n 20'
+alias psmem='ps aux --sort=-%mem'
+alias psmem20='ps aux --sort=-%mem | head -n 20'
+# <<< CHEATSHEET:ALIASES END <<<
+EOF
+# Activate immediately in current shell (bash)
+source "$FILE"
+
+# ---------------------------------------------------------------------
+# 3. DESKTOP, LOCALISATION & UI POLICY (AUTHORITATIVE)
+# ---------------------------------------------------------------------
+#
+# AUTHORITATIVE DESKTOP POLICY
+# The following defines the REQUIRED baseline configuration.
+# Deviations should be deliberate and well documented.
+#
+# Control Centre & Desktop Settings:
+#   - Large-screen defaults
+#   - Desktop background: fjord.jpg
+#   - Boot to desktop: ON
+#   - Auto-login (CLI): OFF
+#   - Auto-login (GUI): OFF
+#   - Mouse acceleration: FASTEST
+#   - Splash screen: OFF
+#   - Performance fan: ON
+#
+# Services:
+#   - SSH: ON
+#   - VNC: ON
+#
+# Localisation:
+#   - Locale: en_AU.UTF-8
+#   - Timezone: Australia/Adelaide
+#   - Keyboard: English (Australia)
+#   - Wi-Fi country: Australia
+#
+# NOTE:
+#   Some settings are GUI-only; this section records intent.
+
+# 3.1 RASPI-CONFIG SETTINGS (COMMON / PI 5 NOTES)
+# -----------------------------------------------
+#
+# Run:
+sudo raspi-config
+#
+# Set / verify:
+#   - Bootloader: latest
+#   - Expand filesystem
+#   - Boot to Desktop (NO auto-login)
+#   - Screen blanking: OFF
+#   - Localisation: verify ALL four options (locale, timezone, keyboard, Wi-Fi)
+#
+
+
+# 3.2 NETWORK MANAGER VERIFICATION & ROUTING
+# ------------------------------------------
+# NOTE:  Pi OS Trixie uses NetworkManager by default.
+systemctl status NetworkManager
+nmcli device status
+
+# Prefer Ethernet over Wi-Fi using route metrics
+# Lower metric = higher priority.
+# IMPORTANT:
+#   These are CONNECTION PROFILE NAMES, not interface names.
+#   Discover names with:
+nmcli connection show
+#
+# Example with specific WiFi SSID name based profiles.
+# Replace D880L50 with your 5Ghz   LAN WiFi SSID
+# Replace D880L24 with your 2.4Ghz LAN WiFi SSID
+# NOTE:
+#   IPv6 route metrics are set defensively for completeness,
+#   even though IPv6 is later disabled system-wide.
+sudo nmcli connection modify netplan-eth0 ipv4.route-metric 100 ipv6.route-metric 100
+sudo nmcli connection modify netplan-wlan0-D880L50 ipv4.route-metric 600 ipv6.route-metric 600
+sudo nmcli connection modify netplan-wlan0-D880L24 ipv4.route-metric 600 ipv6.route-metric 600
+sudo nmcli connection up netplan-eth0
+sudo nmcli connection up netplan-wlan0-D880L50
+sudo nmcli connection up netplan-wlan0-D880L24
+#
+# Check the interface priority metrics:
+ip route show default
+
+
+# 3.3 IPV6 POLICY — DISABLED
+# --------------------------
+#
+# IPv6 is intentionally disabled on this LAN.
+# This simplifies routing, firewalling, and VPN behaviour.
+#
+# METHOD SAFE_ADD_CONFIG (root-owned file = sudo)
+FILE="/etc/sysctl.d/99-disable-ipv6.conf"
+BEGIN_MARK="# >>> CHEATSHEET:DISABLE_IPV6 BEGIN >>>"
+END_MARK="# <<< CHEATSHEET:DISABLE_IPV6 END <<<"
+sudo touch "$FILE"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+sudo awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+  $0==begin {inblk=1; next}
+  $0==end   {inblk=0; next}
+  !inblk    {print}
+' "$FILE" > "$tmp" && sudo tee "$FILE" >/dev/null < "$tmp"
+trap - EXIT
+sudo tee -a "$FILE" >/dev/null <<'EOF'
+# >>> CHEATSHEET:DISABLE_IPV6 BEGIN >>>
+# IPv6 is intentionally disabled on this LAN.
+# This simplifies routing, firewalling, and VPN behaviour.
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+# <<< CHEATSHEET:DISABLE_IPV6 END <<<
+EOF
+sudo sysctl --system
+
+# Verify IPv6 is effectively disabled at runtime:
+ip -6 addr
+ip -6 route
+
+# NOTE:
+#   Some services may briefly bind IPv6 (::) during early boot
+#   before sysctl settings are fully applied.
+#   This does not indicate persistent IPv6 enablement.
+#   VPN software may encapsulate IPv6 internally;
+#   this setting affects #   the host network stack only.
+
+
+# ---------------------------------------------------------------------
+# 4. FIREWALL: NFTABLES + VPN-AWARE LAN ISOLATION (COMMON)
+# ---------------------------------------------------------------------
+#
+# NOTE:
+# Baseline NFTABLES firewall rules to ensure LAN isolation from NORDvpn tunnels and elsewhere.
+#
+# NOTE:
+#   The nftables VPN LAN isolation script uses values from config.env:
+#     LAN_CIDR
+#     LAN_GW
+#   Ensure these match your actual LAN before running the installer script.
+#
+# Custom installer script:
+#   01_install-nft-vpn-lan-isolation.sh
+# which creates:
+#   - /etc/nftables.conf
+#   - /usr/local/sbin/vpn-lan-isolation.sh
+#   - NetworkManager dispatcher hook /etc/NetworkManager/dispatcher.d/90-vpn-lan-isolation
+#
+# Behaviour:
+#   - assumes LAN is 10.0.0.0/24 and LAN gateway is 10.0.0.1
+#   - sets up Dynamically detecting Ethernet/WiFi up and down and adjusts rules accordingly
+#   - sets up Dynanically detecting NORDvpn tunnels up/down and adjusts rules accordingly
+#   - INPUT  default DROP
+#   - OUTPUT default ACCEPT
+#   - VPN UP   -> LAN isolated (except gateway)
+#   - VPN DOWN -> LAN access restored
+#
+# ******************************************************************************************
+# ******************************************************************************************
+# Main script to setup NFTABLES firewall rules 
+# --------------------------------------------
+sudo bash ./01_install-nft-vpn-lan-isolation.sh
+# ******************************************************************************************
+# ******************************************************************************************
+#
+# It creates this file: /usr/local/sbin/vpn-lan-isolation.sh and runs it
+#    sudo /usr/local/sbin/vpn-lan-isolation.sh
+#
+# The created file vpn-lan-isolation.sh
+# -------------------------------------
+# - This script is NOT a daemon.
+# - Once the main script has run, it is invoked automatically by NetworkManager on:
+#     * interface up/down
+#     * VPN connect/disconnect
+#     * routing changes
+# - Each run re-evaluates current VPN state and re-applies the correct firewall rules.
+# - Safe to run repeatedly; no persistent state is kept.
+#
+# For clarity,
+#
+# The script
+# is * **NOT** a one-shot script
+# is * **NOT** a daemon
+# is * **NOT** something you run continuously
+#
+# It is a **small policy-enforcement helper** that is:
+# 1. **Called automatically** by NetworkManager when network state changes
+# 2. **Safe to run manually** for testing, debugging, or forcing state
+# 3. **Idempotent** — running it multiple times just re-applies the same rules
+# 
+# *** Think of it as:
+# > “Re-apply the correct firewall rules *for the current VPN state*.”
+#
+# *** When is "/usr/local/sbin/vpn-lan-isolation.sh" run automatically?
+# ---------------------------------------------------------------------
+# The key mechanism: NetworkManager dispatcher
+# During installation, these files are created:
+#   "/usr/local/sbin/vpn-lan-isolation.sh" <- policy helper (invoked by dispatcher)
+#   "/etc/NetworkManager/dispatcher.d/90-vpn-lan-isolation" <- NetworkManager dispatcher hook (invoked by NetworkManager upon network changes)
+#
+# NetworkManager runs **every executable script in /etc/NetworkManager/dispatcher.d/** when *any* of these events occur:
+#   * Network interface goes **up**
+#   * Network interface goes **down**
+#   * Wi-Fi connects / disconnects
+#   * Ethernet cable plugged / unplugged
+#   * VPN connects
+#   * VPN disconnects
+#   * Routing changes
+#   * DNS changes
+# On each event, NetworkManager calls the dispatcher script with arguments like:
+#   <interface-name> <action>
+# Example:
+#   wlan0 up
+#   eth0 down
+#   nordlynx0 up
+# The dispatcher script does **one thing** ... call /usr/local/sbin/vpn-lan-isolation.sh like this: 
+#   /usr/local/sbin/vpn-lan-isolation.sh apply
+# So:
+#   **Every time network state changes**, the helper script /usr/local/sbin/vpn-lan-isolation.sh is run automatically by the despatcher.
+#
+# *** What does `vpn-lan-isolation.sh apply` actually do?
+# -------------------------------------------------------
+# Internally, it:
+# 1. **Detects whether a VPN interface is currently UP**
+#   * looks for `nordlynx`, `tun*`, `wg*`
+# 2. Chooses one of two policies:
+#   * **VPN UP → LAN ISOLATED**
+#   * **VPN DOWN → LAN ALLOWED**
+# 3. **Flushes and re-installs** only the *relevant nftables sets / rules*
+# 4. Exits
+#
+# There is **no memory**, no background state, no “previous mode”.
+# Each run answers the question:
+#   “Given the *current* system state, what should the firewall look like?”
+#
+# *** Is the the Installer Script 01_install-nft-vpn-lan-isolation.sh run once or many times?
+# ----------------------------------------------------------------------------------------
+# Installer script (`01_install-nft-vpn-lan-isolation.sh`)
+#   * Run **once per system**
+#   * Purpose:
+#     * install nftables
+#     * install helper
+#     * install dispatcher hook
+#   * You normally never run this again unless reinstalling the system
+#
+# Helper script (`vpn-lan-isolation.sh`)
+#   * Run:
+#     * **Automatically**: many times over system lifetime
+#     * **Manually**: whenever you want
+#   * It is expected to run **frequently** being called by the despatcher /etc/NetworkManager/dispatcher.d/90-vpn-lan-isolation
+#
+# *** Why is it designed this way?
+# --------------------------------
+# This design avoids several common problems.
+#   1. No reliance on VPN client hooks
+#   Many VPN guides say:
+#      > “Add firewall rules when VPN connects”
+#   That fails when:
+#     * VPN crashes
+#     * VPN auto-reconnects
+#     * System resumes from sleep
+#     * NetworkManager reorders routes
+#   Here, the firewall logic is **independent** of the VPN client.
+#
+#   2. No race conditions
+#   There is no:
+#     * “remember last state”
+#     * “toggle mode”
+#     * “if already applied, skip”
+#   Every run is a **full reconciliation**.
+#   This means:
+#     * boot order doesn’t matter
+#     * interface order doesn’t matter
+#     * Wi-Fi vs Ethernet doesn’t matter
+#
+#   3. Works across reboots, hotplug, roaming
+#   Example timeline:
+#     1. Boot system (no VPN yet)
+#        * dispatcher runs → VPN DOWN → LAN allowed
+#     2. NordVPN connects
+#        * dispatcher runs → VPN UP → LAN blocked
+#     3. Ethernet unplugged, Wi-Fi connects
+#        * dispatcher runs → VPN still UP → LAN blocked
+#     4. VPN disconnects
+#        * dispatcher runs → VPN DOWN → LAN allowed
+#   No special cases.
+#
+# *** Why not just rely on nftables “dynamic rules”?
+# --------------------------------------------------
+# Because nftables **does not know** whether a VPN is “up” in the semantic sense.
+#   * nftables can match interfaces
+#   * but VPN interfaces can appear/disappear
+#   * interface names can vary
+# The helper script bridges the gap between:
+#   * **system state** (VPN present or not)
+#   * **static firewall policy**
+#
+# *** When would *you* run it manually?
+# -------------------------------------
+# You normally wouldn’t — but it’s useful for:
+#   * Testing / debugging
+#        sudo /usr/local/sbin/vpn-lan-isolation.sh status
+#        sudo /usr/local/sbin/vpn-lan-isolation.sh apply
+#   * Forcing a re-evaluation
+#        /usr/local/sbin/vpn-lan-isolation.sh apply
+#   * Temporarily overriding (rare)
+#        sudo /usr/local/sbin/vpn-lan-isolation.sh off
+#     (then later)
+#        sudo /usr/local/sbin/vpn-lan-isolation.sh on
+# But in normal operation, **NetworkManager does all of the work**.
+# ----
+
+# LIST CURRENT NetworkManager RULES:
+sudo nft list ruleset
+
+# ---------------------------------------------------------------------
+# 5. REMOTE ACCESS & FILE TRANSFER
+# ---------------------------------------------------------------------
+#
+# SSH on the Pi provides the following which are usef for remote connections and for file exchange:
+#   - shell access
+#   - SFTP (FileZilla)
+#   - scp / rsync
+# check the status of SSH on the Pi:
+systemctl status ssh
+
+#
+# 5.1 FTP/FTPS/SFTP SERVER
+# ------------------------
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# No FTP server is installed or required since we can use SSH without further software complexity.
+# FileZilla on a PC can be configured to use **SFTP (SSH File Transfer Protocol)**.
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+#
+# IMPORTANT:
+#   - SFTP is NOT FTP.
+#   - No FTP server runs on the Pi.
+#   - SFTP is provided automatically out-of-the-box by the SSH server (sshd).
+# WHY SFTP:
+#   - Encrypted (unlike classic FTP)
+#   - Uses the same authentication as SSH
+#   - No additional server to install, configure, or firewall
+#   - Works cleanly with nftables and VPN LAN isolation
+# RECOMMENDED PRACTICE FOR SYSTEM FILES:
+#   - Use VNC or SSH terminal for editing (/etc, /usr, etc.)
+#   - Or copy files via SFTP, edit locally, then replace using sudo
+#     from an SSH shell if needed.
+# VPN INTERACTION:
+#   - When VPN is UP:
+#       * LAN access (including SFTP from PC) is intentionally blocked.
+#   - When VPN is DOWN:
+#       * Normal SFTP access from the LAN works.
+# This behaviour is enforced by nftables + vpn-lan-isolation.sh
+# and is by design.
+#
+# WHY FTP / FTPS SERVERS ARE NOT USED ON THIS PI
+# ----------------------------------------------
+# FTP (File Transfer Protocol):
+#   - Sends credentials in clear text (insecure)
+#   - Requires multiple ports (control + data)
+#   - Complicated firewall rules (active/passive modes)
+#   - Poor interaction with VPN-aware firewalling
+# FTPS (FTP over TLS):
+#   - Encrypts traffic, but:
+#       * still requires multiple dynamic ports
+#       * significantly complicates nftables rules
+#       * harder to reason about when VPN is up/down
+#   - Requires an additional daemon and certificate management
+# DESIGN DECISION:
+#   FTP / FTPS are deliberately NOT installed.
+# SFTP (over SSH) is preferred because:
+#   - Single well-known port (22)
+#   - Encrypted by default
+#   - Uses existing SSH authentication
+#   - Minimal firewall surface
+#   - Predictable behaviour with VPN LAN isolation
+# This keeps the system simpler, safer, and easier to audit.
+#
+#
+# 5.2 WINDOWS PC FTP CLIENT - FILEZILLA
+# -------------------------------------
+# FILEZILLA SETTINGS:
+#   Protocol:  SFTP – SSH File Transfer Protocol
+#   Host:      Pi hostname or LAN IP (e.g. 10.0.0.x)
+#   Port:      22
+#   Username:  pi  (or other local user)
+#   Password:  Pi user password (or SSH key if configured)
+# WHAT YOU SEE IN FILEZILLA:
+#   - The remote pane shows a normal directory tree.
+#   - Visibility is governed by standard Unix permissions.
+#   - You can browse:
+#       * /home/pi
+#       * /mnt/...
+#       * /srv/...
+#       * external disks
+# WHAT YOU CANNOT DO DIRECTLY:
+#   - Edit root-owned system files in-place without privileges
+#     (e.g. /etc files).
+# WINDOWS PC FILEZILLA CLIENT (SFTP) — COMMON GOTCHAS & NOTES
+# 1. Passive / Active mode:
+#    - NOT APPLICABLE to SFTP.
+#    - SFTP uses a single encrypted SSH channel.
+#    - Ignore FileZilla FTP mode settings.
+# 2. Symbolic links:
+#    - FileZilla shows symlinks as folders or files.
+#    - Behaviour depends on the target permissions.
+#    - Symlinks pointing outside accessible paths may appear broken.
+# 3. Permissions & ownership:
+#    - FileZilla obeys Unix permissions strictly.
+#    - Root-owned files (e.g. /etc/*) are readable only if permitted.
+#    - Writes to root-owned paths will fail without sudo.
+# 4. Editing files:
+#    - Avoid editing system config files directly via SFTP.
+#    - Preferred workflow:
+#        * edit via VNC or SSH terminal with sudo
+#        * OR copy file out, edit locally, then replace using sudo
+# 5. Large directory trees:
+#    - Browsing very large mounts (e.g. mergerfs media trees)
+#      may be slow on first expansion.
+#    - This is normal and reflects real filesystem traversal.
+# 6. VPN interaction (IMPORTANT):
+#    - When VPN is UP:
+#        * FileZilla connections from LAN will FAIL (by design).
+#    - When VPN is DOWN:
+#        * FileZilla SFTP access works normally.
+# This behaviour is enforced by nftables + vpn-lan-isolation.sh
+# and is intentional.
+#
+#
+# 5.3 VNC SERVER — NATIVE WAYLAND WAYVNC SERVER WITH PAM AUTH
+# -----------------------------------------------------------
+#
+# Policy:
+#   - Use Pi user/password (PAM authentication)
+#   - No VNC-specific password to connect, use pi native username/password instead
+#   - IPv4 ONLY binding (IPv6 was disabled system-wide)
+#
+# METHOD SAFE_ADD_CONFIG (root-owned file = sudo)
+DIR="/etc/wayvnc"
+FILE="/etc/wayvnc/config"
+BEGIN_MARK="# >>> CHEATSHEET:WAYVNC BEGIN >>>"
+END_MARK="# <<< CHEATSHEET:WAYVNC END <<<"
+sudo mkdir -p "$DIR"
+sudo touch "$FILE"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+sudo awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+  $0==begin {inblk=1; next}
+  $0==end   {inblk=0; next}
+  !inblk    {print}
+' "$FILE" > "$tmp" && sudo tee "$FILE" >/dev/null < "$tmp"
+trap - EXIT
+sudo tee -a "$FILE" >/dev/null <<'EOF'
+# >>> CHEATSHEET:WAYVNC BEGIN >>>
+use_relative_paths=true
+# IPv4-only binding (do NOT use address=::)
+address=0.0.0.0
+enable_auth=true
+enable_pam=true
+private_key_file=tls_key.pem
+certificate_file=tls_cert.pem
+rsa_private_key_file=rsa_key.pem
+# <<< CHEATSHEET:WAYVNC END <<<
+EOF
+#
+sudo reboot now
+
+# After reboot, verify wayvnc is listening on IPv4 only:
+ss -tulnp | grep wayvnc
+
+# IMPORTANT NOTE ABOUT CONFIG PRECEDENCE:
+# --- later overrides earlier:
+# 2. global config (can be overridden by a local config)
+#   /etc/wayvnc/config
+# 1. an existing user-specific (based on ~) config overrides the global config
+#   ~/.config/wayvnc/config
+#
+# So ... Ensure that users do NOT have per-user configs if global policy is desired.
+#
+#
+# 5.4 WINDOWS PC VNC CLIENT - TigerVNC Viewer Standalone Version
+# --------------------------------------------------------------
+#
+# On the Windows PC visit
+#   https://github.com/TigerVNC/tigervnc/releases
+# Review the release notes.
+# TigerVNC Binaries are available from SourceForge, so visit
+#   https://sourceforge.net/projects/tigervnc/files
+# Then navigate down to the correct sub-folder in that SourceForge webpage
+# which contains the binary we need (either beta or stable).
+#
+# The TigerVNC Viewer Standalone Version .exe filename will have
+# this format showing bitness and version number:
+#   vncviewer64-1.15.90.exe
+# Note in the filename "64" denoting 64bit, followed by the version.
+# Download the correct "vncviewer64" version to the PC.
+#
+# No installation required, it is a standalone .exe.
+# Put the .exe somewhere accessible.
+# It runs out-of-the-box and connects to the Pi without changing any options.
+#
+# Here is its wiki documentation:
+#   https://tigervnc.org/doc/vncviewer.html
+# Connecting:
+#   Open the TigerVNC viewer 
+#   Type in the name or IP address of the computer you want to connect to, then choose Connect
+#   Type in the username and password you setup for the server. Then choose OK
+
+
+# ---------------------------------------------------------------------
+# 6. FILE SHARING & MEDIA SERVICES, FILESYSTEM LAYOUT 
+# ---------------------------------------------------------------------
+# Recommended:
+#   /mnt/diskX     -> physical disks
+#   /srv/media     -> mergerfs mount
+#
+# NOTE:
+#   Services in this section are for installation and enablement,
+#   but detailed policy and share definitions are intentionally deferred
+#   to Appendices to keep installation steps auditable and reversible.
+
+# 6.1 INOTIFY TUNING (COMMON)
+# ---------------------------
+#
+# Increase inotify limits for file watchers ... miniDLNA etc
+# Required for large trees (media libraries, IDEs, sync tools, etc.).
+#
+# METHOD SAFE_ADD_CONFIG (root-owned file = sudo)
+FILE="/etc/sysctl.d/99-inotify.conf"
+BEGIN_MARK="# >>> CHEATSHEET:INOTIFY BEGIN >>>"
+END_MARK="# <<< CHEATSHEET:INOTIFY END <<<"
+sudo touch "$FILE"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+sudo awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+  $0==begin {inblk=1; next}
+  $0==end   {inblk=0; next}
+  !inblk    {print}
+' "$FILE" > "$tmp" && sudo tee "$FILE" >/dev/null < "$tmp"
+trap - EXIT
+sudo tee -a "$FILE" >/dev/null <<'EOF'
+# >>> CHEATSHEET:INOTIFY BEGIN >>>
+fs.inotify.max_user_watches=524288
+fs.inotify.max_user_instances=1024
+# <<< CHEATSHEET:INOTIFY END <<<
+EOF
+#
+sudo sysctl --system
+
+# Verify effective values are 524288 and 1024:
+sysctl fs.inotify.max_user_watches
+sysctl fs.inotify.max_user_instances
+
+
+# 6.2 SAMBA and CIFS
+# ------------------
+# PURPOSE:
+#   - Provide SMB file sharing to LAN clients
+#   - Provide CIFS client support for mounting remote SMB shares
+# SCOPE:
+#   - Standalone/home LAN usage
+#   - NOT Active Directory
+#   - NOT domain-joined
+# INSTALL:
+sudo apt install -y samba cifs-utils
+
+# SHOW SERVICE STATE:
+#   smbd provides the SMB server.
+#   nmbd (NetBIOS) is optional and may be disabled later.
+sudo systemctl status smbd
+
+# PERFORM SANITY CHECKS:
+smbd --version
+testparm
+
+# IMPORTANT:
+#   - No shares are configured yet.
+#   - No firewall ports are explicitly opened here.
+#   - smb.conf policy and shares are defined in Appendix A.
+
+# ???????????????????????????????????????????
+# Refer to Appendix A for SAMBA configuration 
+# ???????????????????????????????????????????
+
+# 6.3 MINIDLNA
+# ------------
+# NOTE:
+
+# 6.3 MINIDLNA
+# ------------
+# PURPOSE:
+#   - Lightweight DLNA/UPnP media server for LAN devices (TVs, consoles)
+# NOTES:
+#   - Performs filesystem indexing on startup and when media changes
+#   - Benefits from increased inotify limits (see 6.1)
+#   - Intended for LAN use only
+#   nmbd (NetBIOS) is not required for modern SMB usage;
+#      it may be disabled later if name resolution is handled by DNS.
+# NETWORK:
+#   - Uses UDP 1900 (SSDP) and a TCP port (default 8200)
+#   - Firewall rules must allow this on the LAN if nftables is restrictive
+#
+sudo apt install -y minidlna
+sudo systemctl enable --now minidlna
+
+# VERIFY:
+systemctl status minidlna
+
+# ??????????????????????????????????????????????
+# Refer to Appendix B for MINIDLNA configuration 
+# ??????????????????????????????????????????????
+
+# 6.4 NFS SERVER (NFSv4 ONLY)
+# ---------------------------
+# PURPOSE:
+#   - High-performance LAN file sharing (Linux/Unix clients)
+# POLICY:
+#   - NFSv4 ONLY
+#   - No NFSv3
+#   - No rpcbind / portmapper
+#
+sudo apt install -y nfs-kernel-server
+
+# ENABLE NFS SERVICE:
+sudo systemctl enable --now nfs-server
+systemctl status nfs-server
+
+# EXAMPLE EXPORTS:
+#   Example /etc/exports entry:
+#     /srv/media 10.0.0.0/24(rw,sync,no_subtree_check,fsid=0)
+# FIREWALL:
+#   - Allow TCP 2049 only (LAN scope)
+# IMPORTANT:
+#   - Do NOT enable rpcbind.
+#   - NFSv4 does not require it and disabling it reduces attack surface.
+
+# ????????????????????????????????????????????????
+# Refer to Appendix C for NFS SERVER configuration 
+# ????????????????????????????????????????????????
+
+# 6.5 MERGERFS (not normally installed)
+# -------------------------------------
+# IMPORTANT:
+#   Installing mergerfs does NOT create disk mounts.
+#   All disk mount behaviour is defined later via /etc/fstab.
+
+# ???????????????????????????????????????????????????????????????
+# Refer to Appendix D for MERGERFS installation and configuration 
+# ???????????????????????????????????????????????????????????????
+
+# 6.6 NORDVPN (OPTIONAL)
+# ----------------------
+#
+# PURPOSE:
+#   Install NordVPN client on Raspberry Pi OS (Trixie) so the Pi can route its own
+#   traffic via VPN. This interacts with the nftables VPN-aware LAN isolation policy.
+# IMPORTANT POLICY NOTE:
+#   - When the VPN is UP, inbound LAN access to the Pi is intentionally blocked
+#     (except gateway), by nftables policy. This will affect SSH/SFTP/VNC from a PC.
+#   - Prefer to perform initial setup with VPN DISCONNECTED.
+# INSTALL (official NordVPN installer script):
+#   (Nord's installer can add repositories/packages; treat as a change-control step.)
+# CLI INSTALL:
+#   cd ~/Desktop
+#   wget -qO - https://downloads.nordcdn.com/apps/linux/install.sh
+#   sh <(install.sh)
+# OPTIONAL: GUI INSTALL (desktop environments only):
+#           THE GUI IS UNRELIABLE
+#   #sh <(wget -qO - https://downloads.nordcdn.com/apps/linux/install.sh) -p nordvpn-gui
+# POST-INSTALL:
+#   1) Log in (opens browser-based Nord Account flow):
+#        nordvpn login
+#   2) Recommended hardening defaults:
+#        nordvpn set autoconnect off
+#        nordvpn set lan-discovery disabled
+#   3) Connect / disconnect:
+#        nordvpn connect AU
+#        nordvpn connect US
+#        nordvpn connect US Chicago
+#        nordvpn disconnect
+# VERIFY:
+#   nordvpn status
+#   ip route
+# NOTE:
+#   Detailed operational practices (when to disable VPN to regain LAN access, etc.)
+#   are recorded in Section 9 operational checklist.
+#
+
+# ---------------------------------------------------------------------
+# APPENDIX A SAMBA CONFIGURATION
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# APPENDIX B MINIDLNA CONFIGURATION
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# APPENDIX C NFS SERVER CONFIGURATION
+# ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# APPENDEX D MERGERFS — INSTALLATION, VERIFICATION, AND REINSTALLATION
+# ---------------------------------------------------------------------
+#
+# mergerfs is a critical component in this system.
+# It is therefore treated conservatively:
+#   - verify first
+#   - reinstall only if necessary
+#   - configuration (fstab options, policies) is handled separately
+#
+# This section deals ONLY with:
+#   - checking what is installed
+#   - installing or reinstalling mergerfs itself
+# Filesystem layout, mount options, and policies are documented later.
+
+# STEP 6.1.1 CHECK WHETHER MERGERFS IS INSTALLED
+# ----------------------------------------------
+# Check if mergerfs binary exists and is runnable
+which mergerfs
+mergerfs --version
+
+# If the above fails, mergerfs is not installed.
+
+# Check via dpkg (more authoritative)
+dpkg -l | grep -i mergerfs
+
+# Expected:
+#   ii  mergerfs   <version>   <architecture>
+#
+# If no output:
+#   mergerfs is not installed.
+
+# STEP 6.1.1: ALTEST RELEASE (GITHUB) INSTALLATION
+# ------------------------------------------------
+#
+# This introduces maintenance overhead and must be documented.
+#
+# IMPORTANT:
+#   - remove the distro version cleanly first
+#   - install the .deb explicitly
+#   - consider apt pinning to avoid silent replacement
+#
+# Example workflow (adjust paths and version as required):
+
+# Remove existing version (does NOT remove config files)
+sudo apt remove --purge -y mergerfs
+
+# Install pinned .deb
+sudo dpkg -i /path/to/mergerfs_<version>_arm64.deb
+
+# Resolve dependencies if needed
+sudo apt -f install
+
+# Verify
+mergerfs --version
+dpkg -l | grep -i mergerfs
+
+
+# STEP 6.1.2 ALTERNATIVE APT DISTRO VERSION which may not be up-to-date
+# ---------------------------------------------------------------------
+# Default preference:
+#   - use the Raspberry Pi OS / Debian repository version
+#
+# Advantages:
+#   - integrates cleanly with apt
+#   - receives security updates
+#   - predictable behaviour across upgrades
+
+sudo apt update
+sudo apt install -y mergerfs
+
+# Verify after install
+mergerfs --version
+dpkg -l | grep -i mergerfs
+
+# ---------------------------------------------------------------------
+# STEP 5: POST-INSTALLATION NOTES (IMPORTANT)
+# ---------------------------------------------------------------------
+#
+# Installing or reinstalling mergerfs:
+#   - does NOT mount anything automatically
+#   - does NOT alter existing fstab entries
+#   - does NOT change disk contents
+#
+# Mount behaviour is entirely controlled by:
+#   - /etc/fstab
+#   - systemd mount ordering
+#   - mergerfs options (documented later)
+#
+# This separation is intentional.
+#
+# Configuration examples, mount options, and policy decisions
+# are handled in a later section once the final disk layout is known.
+#
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# 9. OPERATIONAL CHECKLIST
+# ---------------------------------------------------------------------
+#
+# - Verify VPN up/down LAN isolation
+# - Verify SSH/SFTP, VNC, SMB
+# - Backup:
+#     /etc/fstab
+#     /etc/samba/smb.conf
+#     /etc/nftables.conf
+#     this cheat sheet
+#
